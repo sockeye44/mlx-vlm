@@ -2,7 +2,7 @@ import argparse
 import glob
 import shutil
 from pathlib import Path
-from typing import Callable, Optional, Union
+from typing import Callable, Optional, Sequence, Union
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -28,6 +28,9 @@ QUANT_RECIPES = [
     "mixed_4_6",
     "mixed_4_8",
 ]
+QUANT_IGNORE_PRESETS = ("gemma4",)
+
+QuantPredicate = Callable[[str, nn.Module], Union[bool, dict]]
 
 
 def _quantization_params(
@@ -45,6 +48,43 @@ def _quantization_params(
         "bits": q_bits or bits,
         "mode": q_mode,
     }
+
+
+def _quant_predicate_with_ignored_modules(
+    quant_predicate: QuantPredicate,
+    ignored_modules: Optional[Union[str, Sequence[str]]],
+    ignore_quant_presets: Optional[Union[str, Sequence[str]]],
+) -> QuantPredicate:
+    def ensure_tuple(value):
+        if value is None:
+            return ()
+        if isinstance(value, str):
+            value = (value,)
+        return tuple(item for item in value if item)
+
+    ignored_modules = ensure_tuple(ignored_modules)
+    ignore_quant_presets = ensure_tuple(ignore_quant_presets)
+    unknown_presets = set(ignore_quant_presets) - set(QUANT_IGNORE_PRESETS)
+    if unknown_presets:
+        raise ValueError(
+            f"Invalid quantization ignore preset: {', '.join(sorted(unknown_presets))}"
+        )
+    if not ignored_modules and not ignore_quant_presets:
+        return quant_predicate
+
+    def ignored_modules_quant_predicate(
+        path: str,
+        module: nn.Module,
+    ) -> Union[bool, dict]:
+        if any(ignored_module in path for ignored_module in ignored_modules):
+            return False
+        if "gemma4" in ignore_quant_presets and not (
+            path == "language_model" or path.startswith("language_model.")
+        ):
+            return False
+        return quant_predicate(path, module)
+
+    return ignored_modules_quant_predicate
 
 
 def _preserve_existing_deepseek_v4_quantization(
@@ -73,7 +113,7 @@ def _preserve_existing_deepseek_v4_quantization(
 
 def mixed_quant_predicate_builder(
     recipe: str, model: nn.Module
-) -> Callable[[str, nn.Module], Union[bool, dict]]:
+) -> QuantPredicate:
     group_size = 64
 
     recipe_config = {
@@ -154,7 +194,9 @@ def convert(
     revision: Optional[str] = None,
     dequantize: bool = False,
     trust_remote_code: bool = True,
-    quant_predicate: Optional[str] = None,
+    quant_predicate: Optional[Union[str, QuantPredicate]] = None,
+    ignore_quant_modules: Optional[Union[str, Sequence[str]]] = None,
+    ignore_quant_presets: Optional[Union[str, Sequence[str]]] = None,
 ):
     print("[INFO] Loading")
     model_path = get_model_path(hf_path, revision=revision)
@@ -174,7 +216,11 @@ def convert(
     if isinstance(quant_predicate, str):
         quant_predicate = mixed_quant_predicate_builder(quant_predicate, model)
 
-    quant_predicate = quant_predicate or base_quant_predicate
+    quant_predicate = _quant_predicate_with_ignored_modules(
+        quant_predicate or base_quant_predicate,
+        ignore_quant_modules,
+        ignore_quant_presets,
+    )
 
     if dtype is None:
         dtype = config.get("torch_dtype", None)
@@ -313,6 +359,28 @@ def configure_parser() -> argparse.ArgumentParser:
         choices=QUANT_RECIPES,
         type=str,
         required=False,
+    )
+    parser.add_argument(
+        "--ignore-quant-module",
+        dest="ignore_quant_modules",
+        action="append",
+        default=None,
+        metavar="MODULE",
+        help=(
+            "Skip quantization for module paths containing MODULE. "
+            "Can be passed multiple times."
+        ),
+    )
+    parser.add_argument(
+        "--ignore-quant-preset",
+        dest="ignore_quant_presets",
+        action="append",
+        choices=QUANT_IGNORE_PRESETS,
+        default=None,
+        help=(
+            "Apply a named quantization ignore preset. "
+            "`gemma4` only quantizes language_model modules."
+        ),
     )
     parser.add_argument(
         "--upload-repo",
